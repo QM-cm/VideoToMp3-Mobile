@@ -1,0 +1,16 @@
+{
+  "name": "视频转 MP3 助手",
+  "short_name": "转MP3",
+  "description": "粘贴视频链接，转成 MP3 / FLAC 音乐（支持 B站、YouTube、抖音、快手等公开视频）",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F0F7F5",
+  "theme_color": "#5BC0A8",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
