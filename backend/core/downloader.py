@@ -60,6 +60,13 @@ def download_bestaudio(url: str, tmp_dir: str, task_id: int,
             info = ydl.extract_info(url, download=True)
             ydl.prepare_filename(info)  # 触发文件名解析（结果用 glob 兜底）
     except _CancelledError:
+        # 取消：清掉 yt-dlp 残留的 .part 下载文件
+        for p in glob.glob(os.path.join(tmp_dir, f"task_{task_id}_{token}.*.part")) \
+                + glob.glob(os.path.join(tmp_dir, f"task_{task_id}_{token}.part")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         raise TaskError("任务已取消。", kind="canceled")
     except (DownloadError, ExtractorError, OSError) as e:
         msg = str(e).lower()

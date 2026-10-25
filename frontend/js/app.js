@@ -2,7 +2,9 @@
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const API = "";
+// API 地址：同源部署留空；前端挂 GitHub Pages、后端独立部署时，
+// 在「设置-服务地址」里填写，例如 https://xxx.onrender.com
+const API = (localStorage.getItem("vmp3_api") || "").replace(/\/+$/, "");
 
 /* ── 工具 ─────────────────────────────────────────── */
 function toast(msg, ms = 2600) {
@@ -101,17 +103,24 @@ function renderTasks() {
 
 /* ── 任务操作 ─────────────────────────────────────── */
 function addJobs(urls, opts) {
+  // 前端去重：已在列表且未终态的同链接不再提交
+  const running = new Set(
+    Object.values(jobs)
+      .filter((t) => ["queued", "pending", "parsing", "downloading", "converting", "canceling"].includes(t.status))
+      .map((t) => t.url));
+  const fresh = urls.filter((u) => !running.has(u));
+  if (!fresh.length) { toast("这些链接已在任务列表中"); return Promise.resolve({ jobs: [] }); }
   return api("/api/convert", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ urls, ...opts }),
+    body: JSON.stringify({ urls: fresh, ...opts }),
   }).then((d) => {
     for (const j of d.jobs) {
       jobs[j.jid] = { jid: j.jid, url: j.url, status: "queued", progress: 0, title: "", artist: "", error: "" };
     }
     renderTasks();
     ensurePoll();
-    toast(`已添加 ${d.jobs.length} 个任务`);
+    toast(`已添加 ${d.jobs.length} 个任务` + (fresh.length < urls.length ? "，重复的已跳过" : ""));
     return d;
   });
 }
@@ -145,8 +154,9 @@ function retryTask(jid) {
 }
 
 function downloadTask(jid) {
+  // 对应手机端：点击后手机浏览器直接下载 mp3/flac 文件到本机「下载」目录
   const a = document.createElement("a");
-  a.href = `/api/download/${jid}`;
+  a.href = API + `/api/download/${jid}`;
   a.download = "";
   document.body.appendChild(a);
   a.click();
@@ -264,6 +274,7 @@ async function loadSettings() {
     $("#set-normalize").checked = !!settings.normalize_loudness;
     $("#set-template").value = settings.name_template;
     $("#set-cover").checked = !!settings.embed_cover;
+    $("#set-api").value = localStorage.getItem("vmp3_api") || "";
     $("#quality-sel").value = settings.quality;
   } catch (e) { /* 后端离线时使用本地默认 */ }
 }
@@ -277,6 +288,11 @@ async function saveSettings() {
     name_template: $("#set-template").value.trim() || "{artist} - {title}.mp3",
     embed_cover: $("#set-cover").checked,
   };
+  // 服务地址保存在本机浏览器（前端静态托管时指向独立后端）
+  const prevApi = (localStorage.getItem("vmp3_api") || "").replace(/\/+$/, "");
+  const apiVal = $("#set-api").value.trim().replace(/\/+$/, "");
+  localStorage.setItem("vmp3_api", apiVal);
+  if (apiVal !== prevApi) { location.reload(); return; }
   try {
     const d = await api("/api/settings", {
       method: "POST",
@@ -285,7 +301,7 @@ async function saveSettings() {
     });
     settings = { ...settings, ...d.settings };
     $("#quality-sel").value = settings.quality;
-    toast("设置已保存");
+    toast(apiVal ? "设置已保存（服务地址：后端）" : "设置已保存");
   } catch (e) { toast(e.message); }
 }
 

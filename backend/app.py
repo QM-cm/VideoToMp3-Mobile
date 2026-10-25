@@ -80,13 +80,16 @@ def _save_cfg(cfg: dict) -> None:
 
 cfg = _load_cfg()
 
-# ── 任务表 ────────────────────────────────────────────
+# ── 任务表与调度 ─────────────────────────────────────
 # jid -> {status, progress, title, artist, error, output_path,
 #         cancel: threading.Event, url, custom_title}
 JOBS: dict[str, dict] = {}
-JOBS_LOCK = threading.Lock()
-# 并发控制
+JOBS_LOCK = threading.RLock()  # RLock：允许嵌套持锁（_new_job 等在 with 块内调用）
+TASK_QUEUE: "queue.Queue[dict]" = queue.Queue()
 _sem: threading.BoundedSemaphore | None = None
+_WORKER_COUNT = 5          # 固定 worker 线程数（永不随任务数增长）
+_workers_started = False
+_workers_lock = threading.Lock()
 
 
 def _set(jid: str, **kw) -> None:
@@ -100,13 +103,14 @@ def _get(jid: str) -> dict | None:
         return JOBS.get(jid)
 
 
-def _new_job(url: str, quality: str) -> dict:
+def _new_job(url: str, quality: str) -> str:
     jid = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[jid] = {
             "status": "queued", "progress": 0, "error": "",
             "output_path": "", "title": "", "artist": "", "url": url,
-            "quality": quality, "thumbnail": "", "cancel": threading.Event(),
+            "quality": quality, "thumbnail": "", "duration": 0,
+            "cancel": threading.Event(),
         }
     return jid
 
@@ -117,6 +121,40 @@ def _semaphore() -> threading.BoundedSemaphore:
     if _sem is None or _sem._initial_value != n:  # noqa: SLF001
         _sem = threading.BoundedSemaphore(n)
     return _sem
+
+
+def _ensure_workers() -> None:
+    """确保常驻 worker 池在跑（线程数固定，任务再多也不堆积线程）。"""
+    global _workers_started
+    with _workers_lock:
+        if _workers_started:
+            return
+        _workers_started = True
+    for _ in range(_WORKER_COUNT):
+        threading.Thread(target=_worker_loop, daemon=True,
+                         name="vmp3-worker").start()
+
+
+def _worker_loop() -> None:
+    while True:
+        item = TASK_QUEUE.get()
+        if item is None:
+            break
+        jid = item["jid"]
+        try:
+            if _get(jid) is None or _get(jid)["cancel"].is_set():
+                _set(jid, status="canceled", progress=0)
+                continue
+            sem = _semaphore()
+            sem.acquire()
+            try:
+                _work(item)
+            finally:
+                sem.release()
+        except Exception:  # noqa: BLE001 - worker 永不退出
+            _set(jid, status="failed", error="内部错误，请重试")
+        finally:
+            TASK_QUEUE.task_done()
 
 
 # ── 历史记录（SQLite） ───────────────────────────────
@@ -231,6 +269,21 @@ def icons(name):
 
 
 # ── 路由：API ─────────────────────────────────────────
+@APP.after_request
+def _cors(resp):
+    """跨域支持：前端可托管在 GitHub Pages 等静态站点，API 独立部署。"""
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Max-Age"] = "600"
+    return resp
+
+
+@APP.route("/api/<path:_sub>", methods=["OPTIONS"])
+def _api_options(_sub):
+    return ("", 204)
+
+
 @APP.route("/api/health")
 def api_health():
     return jsonify({"ok": True, "app": "视频转MP3", "time": time.strftime("%H:%M:%S")})
@@ -277,25 +330,50 @@ def api_convert():
     if start_t and end_t and parse_time(end_t) <= parse_time(start_t):
         return jsonify({"ok": False, "error": "结束时间应晚于开始时间"}), 400
 
+    # 去重：同一链接已有未完成/进行中的任务时，不再重复创建
     jobs = []
-    for url in urls:
-        jid = _new_job(url, quality)
-        jobs.append({"jid": jid, "url": url})
-        threading.Thread(
-            target=_work, daemon=True,
-            args=(jid, url, quality, start_t, end_t, max_t, custom),
-        ).start()
-    return jsonify({"ok": True, "jobs": jobs, "quality": quality})
+    skipped = 0
+    with JOBS_LOCK:
+        running_urls = {
+            j["url"] for j in JOBS.values()
+            if j["status"] not in ("done", "failed", "canceled")
+        }
+        for url in urls:
+            if url in running_urls:
+                skipped += 1
+                continue
+            jid = _new_job(url, quality)
+            jobs.append({"jid": jid, "url": url})
+            TASK_QUEUE.put({
+                "jid": jid, "url": url, "quality": quality,
+                "start_t": start_t, "end_t": end_t, "max_t": max_t,
+                "custom": custom,
+            })
+
+    if not jobs and skipped:
+        return jsonify({"ok": False, "error": f"{skipped} 条链接已在任务列表中，未重复添加"}), 409
+
+    _ensure_workers()
+    return jsonify({"ok": True, "jobs": jobs, "quality": quality,
+                    "skipped": skipped})
 
 
-def _work(jid, url, quality, start_t, end_t, max_t, custom_title) -> None:
+def _work(item: dict) -> None:
+    jid = item["jid"]
+    url = item["url"]
+    quality = item["quality"]
+    start_t = item.get("start_t", "")
+    end_t = item.get("end_t", "")
+    max_t = item.get("max_t", "")
+    custom_title = item.get("custom", "")
     job = _get(jid)
-    sem = _semaphore()
-    sem.acquire()
+    if job is None or job["cancel"].is_set():
+        _set(jid, status="canceled", progress=0)
+        return
+    src = None
+    cover = None
+    _set(jid, status="parsing", progress=2)
     try:
-        if job is None or job["cancel"].is_set():
-            return
-        _set(jid, status="parsing", progress=2)
         info = metadata.extract_metadata(url)
         title = info["title"] or ""
         artist = info["artist"] or ""
@@ -344,11 +422,26 @@ def _work(jid, url, quality, start_t, end_t, max_t, custom_title) -> None:
                 sample_rate=int(cfg.get("sample_rate", 44100)),
                 start_sec=start_sec, duration_sec=dur,
                 normalize_loudness=bool(cfg.get("normalize_loudness", False)),
-                ffmpeg_path="", fmt=fmt)
+                ffmpeg_path="", fmt=fmt,
+                cancel_cb=job["cancel"].is_set)  # 转码中也能立即取消
+            if job["cancel"].is_set():
+                raise TaskError("任务已取消。", kind="canceled")
             if cfg.get("embed_cover", True):
                 tagger.write_tags(part_path, fmt=fmt, title=final_title,
                                   artist=artist, album="", cover_path=cover)
             os.replace(part_path, final_path)
+        except TaskError as e:
+            if e.kind == "canceled":
+                # 取消：清理转码临时文件并释放文件名占用
+                if os.path.exists(part_path):
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+                release_claim(final_path)
+                _set(jid, status="canceled", progress=0)
+                return
+            raise
         except Exception:
             if os.path.exists(part_path):
                 try:
@@ -357,15 +450,6 @@ def _work(jid, url, quality, start_t, end_t, max_t, custom_title) -> None:
                     pass
             release_claim(final_path)
             raise
-        if job["cancel"].is_set():
-            release_claim(final_path)
-            if os.path.exists(final_path):
-                try:
-                    os.remove(final_path)
-                except OSError:
-                    pass
-            _set(jid, status="canceled", progress=0)
-            return
 
         _set(jid, status="done", progress=100, output_path=final_path)
         _db_add(url, final_title, artist, final_path, "done", quality)
@@ -376,7 +460,13 @@ def _work(jid, url, quality, start_t, end_t, max_t, custom_title) -> None:
         _set(jid, status="failed", error=f"未知错误：{str(e)[:200]}")
         _db_add(url, "", "", "", "failed", quality)
     finally:
-        sem.release()
+        # 清理本次任务的临时文件（下载源音频 / 封面），防止累积占盘
+        for f in (src, cover):
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
 
 def _calc(start_t: str, end_t: str, max_t: str, video_duration: float) -> tuple[float, float]:

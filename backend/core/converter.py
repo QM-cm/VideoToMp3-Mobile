@@ -48,12 +48,14 @@ def convert_to_mp3(input_path: str, output_path: str, *,
                    duration_sec: float = 0.0,
                    normalize_loudness: bool = False,
                    ffmpeg_path: str = "",
-                   fmt: str = "mp3") -> None:
+                   fmt: str = "mp3",
+                   cancel_cb=None) -> None:
     """把任意音频输入转成指定格式（mp3 或 flac 无损）。
 
     fmt="mp3"：用 bitrate_kbps 有损压缩；
     fmt="flac"：无损压缩，忽略比特率。
     start_sec>0 时从该时间点裁剪；duration_sec>0 时只取该长度。
+    cancel_cb() 返回 True 时立即终止 ffmpeg 并抛 canceled。
     """
     ffmpeg = find_ffmpeg(ffmpeg_path)
 
@@ -73,16 +75,31 @@ def convert_to_mp3(input_path: str, output_path: str, *,
     cmd.append(output_path)
 
     try:
-        r = subprocess.run(
-            cmd, capture_output=True, timeout=600,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except subprocess.TimeoutExpired:
-        raise TaskError("转码超时（超过 10 分钟）。", kind="unknown")
     except OSError as e:
         raise TaskError(f"调用 ffmpeg 失败：{e}", kind="ffmpeg_missing")
 
-    if r.returncode != 0:
-        err = (r.stderr or b"").decode("utf-8", "ignore").strip()
+    # 轮询等待完成，同时支持中途取消（长视频立即停止，不白等）
+    while True:
+        try:
+            ret = proc.wait(timeout=0.4)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_cb is not None and cancel_cb():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                raise TaskError("任务已取消。", kind="canceled")
+
+    _, err_bytes = proc.communicate()
+
+    if ret != 0:
+        err = (err_bytes or b"").decode("utf-8", "ignore").strip()
         raise TaskError(f"转码失败：{err[-200:] or '未知错误'}", kind="unknown")
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:

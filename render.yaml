@@ -1,0 +1,10 @@
+# Render 免费部署配置（无需自购服务器）
+# 用法：github.com 仓库 → Render Dashboard → New → Web Service → Connect
+# 免费实例冷启动较慢（首次访问约 30-60 秒），之后常驻。
+runtime: python
+buildCommand: pip install -r backend/requirements.txt
+startCommand: gunicorn -w 2 -b 0.0.0.0:10000 backend.app:APP --timeout 300 --graceful-timeout 30
+plan: free
+envVars:
+  - key: PYTHONUNBUFFERED
+    value: "true"
